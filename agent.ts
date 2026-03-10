@@ -50,7 +50,7 @@ const CFG = {
   memSumEvery:    parseInt(process.env.MEM_SUM_EVERY    ?? "10"),
   memMaxLines:    parseInt(process.env.MEM_MAX_LINES    ?? "150"),
   ctxBudgetChars: parseInt(process.env.CTX_BUDGET_CHARS ?? "120000"),
-  sandboxTimeout: parseInt(process.env.SANDBOX_TIMEOUT  ?? "60000"),
+  sandboxTimeout: parseInt(process.env.SANDBOX_TIMEOUT  ?? "600000"),
   msgMaxBytes:    parseInt(process.env.MSG_MAX_BYTES     ?? "65536"),
   embedDim:    512,
   ragTopK:     6,
@@ -827,8 +827,8 @@ If a project already has its own node_modules folder, clean it up:
   await npm_install(["pkg1","pkg2"], "workspace/<project>")   // re-install to shared + symlink
 
 ## ═══ CRITICAL: Skills Folder Usage ═══
-The skills/ folder contains REFERENCE DOCUMENTATION ONLY.
-- Read skills with fs_read() to understand patterns and approaches
+- Always check for existing skills, before doing anything
+- If if the skill does not exist yet, later afte successfully creating the task create the skill (SKILL.md) for future use
 - NEVER import or require() files from skills/ into workspace/ code
 - Skill files are blueprints — rewrite the logic in your workspace project
 - skills/*/SKILL.md explains what the skill does and how to implement it
@@ -846,6 +846,7 @@ ${TOOL_CATALOG}
 - After meaningful exchanges → memory_note()
 - Learned user info → IMMEDIATELY update agent/user.md
 - Learned your own name/role → IMMEDIATELY update agent/soul.md
+- Learned new skills → IMMEDIATELY write skills/<skill-name>/SKILL.md
 
 ## Response — ONLY a single raw JSON object. 
 No preamble, no explanation, no markdown fences. 
