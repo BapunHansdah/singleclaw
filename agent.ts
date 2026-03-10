@@ -34,10 +34,6 @@ dotenv.config();
 const execAsync = promisify(exec);
 
 // ─────────────────────────────────────────────────────────────
-// Main thread
-// ─────────────────────────────────────────────────────────────
-
-// ─────────────────────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────────────────────
 
@@ -57,10 +53,15 @@ const CFG = {
   sandboxTimeout: parseInt(process.env.SANDBOX_TIMEOUT  ?? "60000"),
   msgMaxBytes:    parseInt(process.env.MSG_MAX_BYTES     ?? "65536"),
   embedDim:    512,
+  ragTopK:     6,
+  recentMsgCount: 10,  // how many recent DB messages to restore into history
   shellBlocklist: (process.env.SHELL_BLOCKLIST ?? "rm -rf /,:(){ :|:& };:,mkfs,dd if=").split(","),
 } as const;
 
 const ROOTS = [path.resolve(CFG.agentDir), path.resolve(CFG.workDir), path.resolve(CFG.skillsDir)];
+
+// Shared node_modules root — all workspace projects symlink here
+const SHARED_MODULES_DIR = path.resolve(CFG.workDir, ".shared_node_modules");
 
 // ─────────────────────────────────────────────────────────────
 // Structured logger
@@ -101,7 +102,7 @@ function resolvePath(p: string): string {
 // Bootstrap dirs + identity stubs
 // ─────────────────────────────────────────────────────────────
 
-for (const d of [CFG.agentDir, CFG.workDir, CFG.skillsDir])
+for (const d of [CFG.agentDir, CFG.workDir, CFG.skillsDir, SHARED_MODULES_DIR])
   await fs.mkdir(d, { recursive: true });
 
 async function readMd(file: string): Promise<string> {
@@ -111,8 +112,7 @@ async function writeMd(file: string, content: string) {
   await fs.writeFile(path.join(CFG.agentDir, file), content, "utf8");
 }
 
-// Identity files start empty — agent fills them naturally via fs_write
-// memory.md gets a heading so appends have context
+// Identity files — memory.md gets heading so appends have context
 if (!await readMd("memory.md")) await writeMd("memory.md", `# Memory\n`);
 
 // ─────────────────────────────────────────────────────────────
@@ -153,16 +153,18 @@ db.exec(`
 `);
 
 const sql = {
-  insertMem:   db.prepare(`INSERT INTO memories VALUES(@id,@content,@embedding,@tags,@source,@ts)`),
-  allMem:      db.prepare(`SELECT * FROM memories ORDER BY ts DESC LIMIT 400`),
-  insertTask:  db.prepare(`INSERT INTO tasks(id,goal,status,parentId,deps,result,error,startedAt,completedAt,ts,updatedAt) VALUES(@id,@goal,@status,@parentId,@deps,@result,@error,@startedAt,@completedAt,@ts,@updatedAt)`),
-  updateTask:  db.prepare(`UPDATE tasks SET status=@status,result=@result,error=@error,completedAt=@completedAt,updatedAt=@updatedAt WHERE id=@id`),
-  getTask:     db.prepare(`SELECT * FROM tasks WHERE id=?`),
-  insertMsg:   db.prepare(`INSERT INTO messages VALUES(@id,@role,@content,@session,@ts)`),
-  recentMsgs:  db.prepare(`SELECT * FROM messages ORDER BY ts DESC LIMIT 60`),
-  turnGet:     db.prepare(`SELECT n FROM turn_count WHERE session=?`),
-  turnUpsert:  db.prepare(`INSERT INTO turn_count(session,n) VALUES(@session,@n) ON CONFLICT(session) DO UPDATE SET n=@n`),
-  insertMetric:db.prepare(`INSERT INTO metrics VALUES(@id,@type,@session,@durationMs,@ts)`),
+  insertMem:      db.prepare(`INSERT INTO memories VALUES(@id,@content,@embedding,@tags,@source,@ts)`),
+  allMem:         db.prepare(`SELECT * FROM memories ORDER BY ts DESC LIMIT 400`),
+  insertTask:     db.prepare(`INSERT INTO tasks(id,goal,status,parentId,deps,result,error,startedAt,completedAt,ts,updatedAt) VALUES(@id,@goal,@status,@parentId,@deps,@result,@error,@startedAt,@completedAt,@ts,@updatedAt)`),
+  updateTask:     db.prepare(`UPDATE tasks SET status=@status,result=@result,error=@error,completedAt=@completedAt,updatedAt=@updatedAt WHERE id=@id`),
+  getTask:        db.prepare(`SELECT * FROM tasks WHERE id=?`),
+  insertMsg:      db.prepare(`INSERT INTO messages VALUES(@id,@role,@content,@session,@ts)`),
+  recentMsgs:     db.prepare(`SELECT * FROM messages ORDER BY ts DESC LIMIT 60`),
+  // FIX: load recent messages per session, oldest-first so history is chronological
+  sessionMsgs:    db.prepare(`SELECT * FROM (SELECT * FROM messages WHERE session=? ORDER BY ts DESC LIMIT ?) ORDER BY ts ASC`),
+  turnGet:        db.prepare(`SELECT n FROM turn_count WHERE session=?`),
+  turnUpsert:     db.prepare(`INSERT INTO turn_count(session,n) VALUES(@session,@n) ON CONFLICT(session) DO UPDATE SET n=@n`),
+  insertMetric:   db.prepare(`INSERT INTO metrics VALUES(@id,@type,@session,@durationMs,@ts)`),
 };
 
 function getTurns(s: string): number { return (sql.turnGet.get(s) as { n: number } | undefined)?.n ?? 0; }
@@ -241,7 +243,6 @@ async function callModel(
       const name = (e as { name?: string }).name ?? "";
       const isRetryable = name === "ThrottlingException" || name === "ServiceUnavailableException" || name === "ModelStreamErrorException";
       if (isRetryable && attempt < 3) {
-        // exponential backoff with jitter: base * 2^attempt + jitter(0..1000ms)
         const wait = Math.min(30000, 1000 * Math.pow(2, attempt) + Math.random() * 1000);
         log.warn("Bedrock retry", { name, attempt, waitMs: Math.round(wait) });
         await new Promise(r => setTimeout(r, wait));
@@ -304,7 +305,7 @@ async function memorySave(content: string, tags: string[] = [], source = "agent"
 
   // Dedup — skip if a very similar memory already exists (cosine > 0.93)
   const existing = sql.allMem.all() as Array<{ id: string; content: string; embedding: string | null }>;
-  for (const row of existing.slice(0, 50)) { // check recent 50
+  for (const row of existing.slice(0, 50)) {
     if (!row.embedding) continue;
     const sim = cosine(embedding, JSON.parse(row.embedding) as number[]);
     if (sim > 0.93) {
@@ -323,14 +324,13 @@ async function memorySearch(query: string, topK = 6) {
   return (sql.allMem.all() as Array<{ content: string; embedding: string | null; source: string; ts: number }>)
     .map(r => ({ content: r.content, source: r.source, ts: r.ts, score: r.embedding ? cosine(qv, JSON.parse(r.embedding) as number[]) : 0 }))
     .sort((a, b) => b.score - a.score).slice(0, topK)
-    .filter(r => r.score > 0.3); // only return reasonably relevant
+    .filter(r => r.score > 0.3);
 }
 
 async function appendMemoryNote(note: string) {
   const p = path.join(CFG.agentDir, "memory.md");
   await fs.appendFile(p, `\n## ${new Date().toLocaleString()}\n${note.trim()}\n`, "utf8");
 
-  // Size cap — if too many lines, trigger early summarization
   const content = await fs.readFile(p, "utf8");
   if (content.split("\n").length > CFG.memMaxLines) {
     log.info("memory.md cap reached, summarizing early");
@@ -355,6 +355,48 @@ async function maybeSummarizeMemory(session: string) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// FIX: Always-on RAG — builds rich context from memory + recent msgs
+// ─────────────────────────────────────────────────────────────
+
+async function buildRagContext(query: string): Promise<string> {
+  const parts: string[] = [];
+
+  // 1. Semantic memory search — find relevant past memories
+  try {
+    const hits = await memorySearch(query, CFG.ragTopK);
+    if (hits.length > 0) {
+      parts.push("## Relevant Memories\n" + hits.map(h =>
+        `- [score: ${h.score.toFixed(2)}, source: ${h.source}] ${h.content.slice(0, 300)}`
+      ).join("\n"));
+    }
+  } catch (e) {
+    log.warn("RAG memory search failed", { err: String(e) });
+  }
+
+  // 2. Recent conversation messages from DB for this broader context
+  // (Already injected via history, so we skip duplicating them here)
+
+  return parts.length > 0 ? "\n\n" + parts.join("\n\n") : "";
+}
+
+// ─────────────────────────────────────────────────────────────
+// FIX: Load recent session messages from DB into history
+// ─────────────────────────────────────────────────────────────
+
+function loadSessionHistory(session: string): Message[] {
+  type MsgRow = { role: string; content: string; ts: number };
+  const rows = sql.sessionMsgs.all(session, CFG.recentMsgCount) as MsgRow[];
+  if (rows.length === 0) return [];
+
+  // Convert to Message[] — skip the very last user message (we're about to add it)
+  // We include all but hold the last to avoid duplication
+  return rows.slice(0, -1).map(r => ({
+    role: r.role as "user" | "assistant",
+    content: [{ text: r.content } as ContentBlock],
+  }));
+}
+
+// ─────────────────────────────────────────────────────────────
 // Semantic file search
 // ─────────────────────────────────────────────────────────────
 
@@ -366,7 +408,11 @@ async function searchFiles(query: string, dirs: string[], topK = 6): Promise<str
     try { entries = await fs.readdir(dir, { withFileTypes: true }) as fsSync.Dirent[]; } catch { return; }
     for (const e of entries) {
       const full = path.join(dir, e.name);
-      if (e.isDirectory() && !e.name.startsWith(".")) { await walk(full); continue; }
+      // FIX: skip node_modules and .shared_node_modules during file search
+      if (e.isDirectory()) {
+        if (e.name === "node_modules" || e.name === ".shared_node_modules" || e.name.startsWith(".")) continue;
+        await walk(full); continue;
+      }
       if (e.isFile() && /\.(md|txt|ts|js|mjs|json|yaml|yml|sh|py|toml)$/.test(e.name)) {
         try { hits.push({ file: full, score: cosine(qv, await embed((await fs.readFile(full, "utf8")).slice(0, 800))) }); }
         catch { /* skip */ }
@@ -385,7 +431,7 @@ function watchSkills() {
   try {
     fsSync.watch(CFG.skillsDir, { recursive: true }, (event, filename) => {
       if (filename) {
-        embedCache.clear(); // force re-embed on next search
+        embedCache.clear();
         log.info("Skills changed, embed cache cleared", { event, filename });
         broadcast("skills_reload", { filename });
       }
@@ -399,12 +445,11 @@ function watchSkills() {
 
 const TOOL_NAMES = [
   "fs_read","fs_write","fs_append","fs_list","fs_delete","fs_move","fs_exists","fs_stat",
-  "shell","memory_save","memory_search","memory_note",
+  "shell","npm_install","memory_save","memory_search","memory_note",
   "skill_install","search_files","db_run","http_get","http_post",
   "get_embedding","cosine_similarity",
 ];
 
-// Actual tool implementations — called when worker requests them
 async function dispatchTool(name: string, args: unknown[]): Promise<unknown> {
   switch (name) {
     case "fs_read":    return fs.readFile(resolvePath(args[0] as string), "utf8");
@@ -412,16 +457,30 @@ async function dispatchTool(name: string, args: unknown[]): Promise<unknown> {
     case "fs_append":  await fs.appendFile(resolvePath(args[0] as string), args[1] as string, "utf8"); return `appended ${args[0]}`;
     case "fs_list":    return (await fs.readdir(resolvePath(args[0] as string), { withFileTypes: true })).map(e => `${e.isDirectory() ? "d" : "f"} ${e.name}`);
     case "fs_delete":  await fs.rm(resolvePath(args[0] as string), { recursive: true, force: true }); return `deleted ${args[0]}`;
-    case "fs_move":    await fs.rename(resolvePath(args[0] as string), resolvePath(args[1] as string)); return `moved ${args[0]} → ${args[1]}`;
+    case "fs_move":    await fs.rename(resolvePath(args[0] as string), resolvePath(args[1] as string)); return `moved ${args[0]}`;
     case "fs_exists":  try { await fs.access(resolvePath(args[0] as string)); return true; } catch { return false; }
     case "fs_stat": { const s = await fs.stat(resolvePath(args[0] as string)); return { size: s.size, mtime: s.mtime.toISOString(), isDir: s.isDirectory() }; }
 
     case "shell": {
       const cmd = args[0] as string;
-      // Shell blocklist check
       if (CFG.shellBlocklist.some(b => b.trim() && cmd.includes(b.trim()))) {
         log.warn("Shell blocked", { cmd: cmd.slice(0, 100) });
         return { stdout: "", stderr: "Command blocked by policy", code: 1 };
+      }
+      // Intercept bare "npm install" so the agent can't accidentally create
+      // local node_modules. Redirect them to use the npm_install() tool instead.
+      if (/\bnpm\s+i(?:nstall)?\b/.test(cmd) && !cmd.includes("--prefix")) {
+        log.warn("Bare npm install intercepted — redirecting to npm_install tool", { cmd: cmd.slice(0, 120) });
+        return {
+          stdout: "",
+          stderr: [
+            "ERROR: Do not run 'npm install' directly — it creates local node_modules and wastes disk space.",
+            `Use the npm_install() tool instead:`,
+            `  npm_install(["<package>"], "workspace/<your-project>")`,
+            `This installs to the shared location (${SHARED_MODULES_DIR}) and symlinks automatically.`,
+          ].join("\n"),
+          code: 1,
+        };
       }
       log.info("Shell exec", { cmd: cmd.slice(0, 120) });
       const wd = args[1] ? resolvePath(args[1] as string) : path.resolve(CFG.workDir);
@@ -434,31 +493,77 @@ async function dispatchTool(name: string, args: unknown[]): Promise<unknown> {
       }
     }
 
+    // ── npm_install: always installs to shared location + symlinks into project ──
+    case "npm_install": {
+      // args[0]: string | string[]  — package name(s)
+      // args[1]: string             — project dir (e.g. "workspace/my-app")
+      const pkgs   = Array.isArray(args[0]) ? args[0] as string[] : [args[0] as string];
+      const projRaw = args[1] as string | undefined;
+
+      if (!pkgs.length || pkgs.some(p => !p)) throw new Error("npm_install: package name(s) required");
+
+      const sharedDir  = SHARED_MODULES_DIR;                          // absolute
+      const sharedMods = path.join(sharedDir, "node_modules");        // absolute
+
+      // 1. Install into shared prefix (absolute path — no cwd ambiguity)
+      log.info("npm_install → shared", { pkgs, sharedDir });
+      const installCmd = `npm install --prefix ${sharedDir} ${pkgs.map(p => JSON.stringify(p)).join(" ")}`;
+      try {
+        const { stdout, stderr } = await execAsync(installCmd, {
+          timeout: 120_000,
+          env: { ...process.env },
+        });
+        log.debug("npm install stdout", { out: stdout.slice(0, 300) });
+        if (stderr && !stderr.includes("npm warn")) log.warn("npm install stderr", { err: stderr.slice(0, 300) });
+      } catch (e: unknown) {
+        const err = e as { stderr?: string };
+        throw new Error(`npm install failed: ${err.stderr ?? String(e)}`);
+      }
+
+      const results: string[] = [`Installed ${pkgs.join(", ")} → ${sharedMods}`];
+
+      // 2. If a project dir was supplied, symlink shared node_modules into it
+      if (projRaw) {
+        const projAbs  = resolvePath(projRaw);                        // guards against path traversal
+        const linkDest = path.join(projAbs, "node_modules");
+
+        // Remove existing (real or stale symlink) if present
+        try { await fs.rm(linkDest, { recursive: true, force: true }); } catch { /* ignore */ }
+
+        // Create symlink: projAbs/node_modules → sharedMods
+        await fs.symlink(sharedMods, linkDest);
+        results.push(`Symlinked → ${linkDest}`);
+        log.info("npm_install symlink created", { linkDest, target: sharedMods });
+      }
+
+      return results.join("\n");
+    }
+
     case "memory_save":   return memorySave(args[0] as string, args[1] as string[] | undefined);
     case "memory_search": return memorySearch(args[0] as string, args[1] as number | undefined);
     case "memory_note":   await appendMemoryNote(args[0] as string); return "noted";
 
     case "skill_install": {
-      const [owner, name] = (args[0] as string).split("/");
-      if (!owner || !name) throw new Error(`Expected owner/repo`);
-      const dest = path.join(CFG.skillsDir, name);
+      const [owner, repoName] = (args[0] as string).split("/");
+      if (!owner || !repoName) throw new Error(`Expected owner/repo`);
+      const dest = path.join(CFG.skillsDir, repoName);
       await fs.mkdir(dest, { recursive: true });
       let content = "";
       for (const f of ["SKILL.md", "README.md"]) {
-        const res = await fetch(`https://raw.githubusercontent.com/${owner}/${name}/main/${f}`).catch(() => null);
+        const res = await fetch(`https://raw.githubusercontent.com/${owner}/${repoName}/main/${f}`).catch(() => null);
         if (res?.ok) { content = await res.text(); break; }
       }
       if (!content) throw new Error(`No SKILL.md or README.md in ${args[0]}`);
       await fs.writeFile(path.join(dest, "SKILL.md"), content, "utf8");
       for (const [, f] of content.matchAll(/`([\w./][\w./-]+\.(ts|js|sh|py|json|yaml|yml))`/g)) {
         if (!f.includes("/")) continue;
-        const res = await fetch(`https://raw.githubusercontent.com/${owner}/${name}/main/${f}`).catch(() => null);
+        const res = await fetch(`https://raw.githubusercontent.com/${owner}/${repoName}/main/${f}`).catch(() => null);
         if (!res?.ok) continue;
         const out = path.join(dest, f);
         await fs.mkdir(path.dirname(out), { recursive: true });
         await fs.writeFile(out, await res.text(), "utf8");
       }
-      return `Installed "${name}" → skills/${name}/`;
+      return `Installed "${repoName}" → skills/${repoName}/`;
     }
 
     case "search_files":    return searchFiles(args[0] as string, (args[1] as string[] | undefined ?? [CFG.workDir, CFG.skillsDir]).map(d => path.resolve(d)));
@@ -471,7 +576,6 @@ async function dispatchTool(name: string, args: unknown[]): Promise<unknown> {
   }
 }
 
-// Worker script as a string — avoids spawning .ts file which Node can't run directly
 const WORKER_SCRIPT = `
 const { workerData, parentPort } = require('worker_threads');
 const { code, toolNames } = workerData;
@@ -541,7 +645,7 @@ async function runCode(code: string): Promise<{ output: string; error?: string }
 }
 
 // ─────────────────────────────────────────────────────────────
-// Session queue — prevents interleaved broadcasts per session
+// Session queue
 // ─────────────────────────────────────────────────────────────
 
 const sessionQueues = new Map<string, Promise<string>>();
@@ -550,7 +654,6 @@ function enqueue(session: string, fn: () => Promise<string>): Promise<string> {
   const prev = sessionQueues.get(session) ?? Promise.resolve("");
   const next = prev.then(() => fn()).catch(e => { log.error("Queue error", { session, err: String(e) }); return String(e); });
   sessionQueues.set(session, next);
-  // Clean up after done
   next.finally(() => { if (sessionQueues.get(session) === next) sessionQueues.delete(session); });
   return next;
 }
@@ -590,7 +693,7 @@ function broadcast(type: string, payload: unknown) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// System prompt — built fresh each turn
+// System prompt
 // ─────────────────────────────────────────────────────────────
 
 const TOOL_CATALOG = `
@@ -606,8 +709,18 @@ fs_move(src, dest)             → "moved …"
 fs_exists(path)                → boolean
 fs_stat(path)                  → {size, mtime, isDir}
 
-### Shell  (cwd defaults to workspace/)
+### Shell  (cwd defaults to workspace/ absolute path — do NOT use relative workspace/ prefix in cmds)
 shell(cmd, cwd?)               → {stdout, stderr, code}
+⚠️  shell() cwd is already workspace/ — never pass "workspace/foo", just pass "foo" or use npm_install()
+
+### npm packages — ALWAYS use this, never run "npm install" via shell()
+npm_install(packages, projectDir?) → installs to shared location + symlinks into project
+  packages:   string | string[]   — package name(s), e.g. ["express","dotenv"] or "lodash"
+  projectDir: string (optional)   — e.g. "workspace/my-app" — gets a node_modules symlink
+  Examples:
+    await npm_install("express", "workspace/my-app")
+    await npm_install(["typescript","ts-node"], "workspace/my-app")
+    await npm_install("lodash")   // install only, no symlink yet
 
 ### Memory
 memory_save(content, tags?)    → id
@@ -633,35 +746,106 @@ cosine_similarity(a, b)        → number`;
 
 async function buildSystem(): Promise<string> {
   const [soul, user, memory] = await Promise.all([readMd("soul.md"), readMd("user.md"), readMd("memory.md")]);
+  const soulFilled = soul.trim().length > 0;
+  const userFilled = user.trim().length > 0;
 
   return `## Identity
-${soul || "(not written yet)"}
+${soul || "(not yet written — MUST be filled in on first meaningful interaction)"}
 
-## User
-${user || "(not written yet)"}
+## User Profile
+${user || "(not yet written — MUST be filled in once you learn user's name/preferences)"}
 
 ## Memory
 ${memory}
 
-## Identity files (agent/ dir)
-- agent/soul.md — your name, personality, role
-- agent/user.md — the user's name, preferences, context
-These files start empty. Learn this info naturally through conversation — never ask all at once.
-When you learn something relevant, write it with fs_write("agent/soul.md", ...) or fs_write("agent/user.md", ...).
-You can also create any other .md files in agent/ for knowledge you want to keep.
+## ═══ CRITICAL: Identity File Rules ═══
+You MUST maintain soul.md and user.md. These are not optional.
+
+### soul.md — YOUR identity (agent/soul.md)
+${!soulFilled ? `⚠️  soul.md IS EMPTY. You must write it NOW if you know your name/role, or ask the user.` : "✓ soul.md exists — keep it updated as you learn more about yourself."}
+- Contains: Name, personality, role, capabilities, values
+- Write with: fs_write("agent/soul.md", content)
+- Update whenever you learn something new about your own role or purpose
+
+### user.md — USER profile (agent/user.md)  
+${!userFilled ? `⚠️  user.md IS EMPTY. In your FIRST reply, naturally learn the user's name. Once you know it, write user.md immediately.` : "✓ user.md exists — update it as you learn more preferences."}
+- Contains: User's name, preferences, expertise level, timezone, projects
+- Write with: fs_write("agent/user.md", content)
+- Learn naturally: don't interview them — pick up info from the conversation
+- Update it incrementally every time you learn something new about the user
+
+RULE: If soul.md or user.md are empty at the start of a response, you MUST either:
+  a) Write them with what you know, or
+  b) Ask ONE natural question to learn what's needed to fill them in
+
+## ═══ CRITICAL: Workspace File Organization ═══
+NEVER create files directly in workspace/ root. ALWAYS create a project subfolder first.
+
+✓ CORRECT:  workspace/my-app/index.js
+✓ CORRECT:  workspace/todo-cli/src/main.ts  
+✗ WRONG:    workspace/index.js
+✗ WRONG:    workspace/main.ts
+
+Every project gets its own folder: workspace/<project-name>/
+
+## ═══ CRITICAL: Module System Rules ═══
+PICK ONE module system per project and NEVER mix them.
+
+### For TypeScript / Modern JS projects → use ESM:
+- package.json must have: "type": "module"
+- Use: import/export syntax
+- File extension: .ts or .mjs
+- tsconfig: "module": "NodeNext", "moduleResolution": "NodeNext"
+
+### For CommonJS projects → use CJS:
+- package.json must NOT have "type": "module" (or set "type": "commonjs")  
+- Use: require()/module.exports syntax
+- File extension: .js or .cjs
+
+NEVER mix require() and import in the same project. Check package.json "type" field first.
+
+## ═══ CRITICAL: node_modules — ALWAYS use npm_install() tool ═══
+NEVER run "npm install" via shell() — it creates node_modules in the wrong place.
+The shell() tool intercepts bare "npm install" and returns an error on purpose.
+
+Use the npm_install() tool instead. It:
+  1. Installs packages to the shared location: ${SHARED_MODULES_DIR}
+  2. Creates a symlink workspace/<project>/node_modules → shared location
+  3. Uses absolute paths internally — no cwd confusion possible
+
+✓ CORRECT:
+  await npm_install("express", "workspace/my-app")
+  await npm_install(["typescript", "@types/node"], "workspace/my-app")
+
+✗ WRONG — these will be blocked or broken:
+  await shell("npm install express")
+  await shell("npm install --prefix workspace/.shared_node_modules express")
+  await shell("cd workspace/my-app && npm install")
+
+If a project already has its own node_modules folder, clean it up:
+  await fs_delete("workspace/<project>/node_modules")
+  await npm_install(["pkg1","pkg2"], "workspace/<project>")   // re-install to shared + symlink
+
+## ═══ CRITICAL: Skills Folder Usage ═══
+The skills/ folder contains REFERENCE DOCUMENTATION ONLY.
+- Read skills with fs_read() to understand patterns and approaches
+- NEVER import or require() files from skills/ into workspace/ code
+- Skill files are blueprints — rewrite the logic in your workspace project
+- skills/*/SKILL.md explains what the skill does and how to implement it
+
+✗ WRONG:  import { helper } from '../../skills/my-skill/helper.js'
+✓ RIGHT:  Read skills/my-skill/SKILL.md → implement equivalent logic in workspace/
 
 ## Skill directory
-- Always check for existing skills, before doing anything
-- If if the skill does not exist yet, later afte successfully creating the task create the skill (SKILL.md) for future use
+- ALWAYS check for relevant skills/ files before starting a task
+- After completing a task successfully, write a SKILL.md for future reuse
 
 ${TOOL_CATALOG}
 
 ## Self-learning
 - After meaningful exchanges → memory_note()
-- Learned user info → update agent/user.md
-- Learned your own name/role → update agent/soul.md
-
-
+- Learned user info → IMMEDIATELY update agent/user.md
+- Learned your own name/role → IMMEDIATELY update agent/soul.md
 
 ## Response — ONLY a single raw JSON object. 
 No preamble, no explanation, no markdown fences. 
@@ -679,16 +863,9 @@ Only use "code" when you actually need to read/write files, run commands, or cal
   "confidence": 0.0-1.0
 }
 
-
-## Workspace
- while creating any file, dont create everything under root dir. instead create a folder under workspace/ dir.
- for example: if you want to create a file named "test.txt", create a directory named "test" under workspace/ dir.  
-
-##security
- Do not store secrets in code blocks. always use .env file to store secrets.
-
+## Security
+Do not store secrets in code. Always use .env files for secrets.
 `;
-
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -705,13 +882,8 @@ interface Decision {
   confidence: number;
 }
 
-// function parseDecision(raw: string): Decision {
-//   try { return JSON.parse(raw.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim()) as Decision; }
-//   catch { return { reasoning: "parse error", action: "reply", reply: raw.slice(0, 2000), confidence: 0.3 }; }
-// }
-
 function parseDecision(raw: string): Decision {
-  // 1. Try raw parse first (ideal case — pure JSON response)
+  // 1. Try raw parse first (ideal — pure JSON response)
   try { return JSON.parse(raw.trim()) as Decision; } catch { /* fall through */ }
 
   // 2. Extract ALL fenced blocks and try each one
@@ -720,11 +892,11 @@ function parseDecision(raw: string): Decision {
     if (!block) continue;
     try {
       const parsed = JSON.parse(block) as Decision;
-      if (parsed.action) return parsed; // must look like a Decision
+      if (parsed.action) return parsed;
     } catch { /* try next block */ }
   }
 
-  // 3. Try to find a bare JSON object with an "action" key anywhere in the text
+  // 3. Find a bare JSON object with an "action" key
   const bareMatch = raw.match(/(\{[\s\S]*?"action"\s*:[\s\S]*?\})\s*$/);
   if (bareMatch?.[1]) {
     try {
@@ -733,7 +905,7 @@ function parseDecision(raw: string): Decision {
     } catch { /* fall through */ }
   }
 
-  // 4. Last resort — treat the whole raw text as a reply
+  // 4. Last resort — treat whole raw text as reply
   return { reasoning: "parse error", action: "reply", reply: raw.slice(0, 2000), confidence: 0.3 };
 }
 
@@ -749,36 +921,34 @@ async function runAgent(userMsg: string, session: string): Promise<string> {
   const agentName = await getAgentName();
   const system = await buildSystem();
 
-  let history: Message[] = [];
+  // FIX: Restore recent session history from DB so agent remembers prior turns
+  let history: Message[] = loadSessionHistory(session);
+  log.info("Loaded session history", { session, msgs: history.length });
+
   const root  = taskCreate(userMsg);
   taskPatch(root.id, { status: "running", startedAt: Date.now() });
 
-  // Work log — persists across iters within this loop so agent never forgets
   const workLog: string[] = [];
-
   let current    = userMsg;
   let finalReply = "";
 
   for (let iter = 0; iter < CFG.maxIter; iter++) {
     const iterT0 = Date.now();
 
-    // ── Always-on RAG — injected into EVERY iteration ─────────
-    // const ragCtx = await buildRagContext(current);
-    const ragCtx = '';
+    // FIX: Actually build RAG context from memory + semantic search
+    const ragCtx = await buildRagContext(current);
 
-    // Build the full context message for this iter
     const workLogBlock = workLog.length
       ? `\n\n## Work log (what I've done so far this task)\n${workLog.map((l, i) => `${i+1}. ${l}`).join("\n")}`
       : "";
 
-    const iterMsg = `${current}${workLogBlock}${ragCtx ? "\n\n" + ragCtx : ""}`;
+    const iterMsg = `${current}${workLogBlock}${ragCtx}`;
 
     history.push({ role: "user", content: [{ text: iterMsg } as ContentBlock] });
 
     // Compress history if context budget exceeded
     history = await compressHistory(history);
 
-    // ── Stream thinking ───────────────────────────────────────
     broadcast("thinking_start", { iter: iter + 1 });
     let raw = "";
     try {
@@ -788,17 +958,15 @@ async function runAgent(userMsg: string, session: string): Promise<string> {
     }
 
     const decision = parseDecision(raw);
-    console.log("decision",decision)
+    log.debug("decision", { action: decision.action, confidence: decision.confidence });
     history.push({ role: "assistant", content: [{ text: raw } as ContentBlock] });
     broadcast("decision", { action: decision.action, confidence: decision.confidence });
 
-    // Persist memory note
     if (decision.note?.trim()) {
       await appendMemoryNote(decision.note);
       await memorySave(decision.note, ["auto_note"], "agent");
     }
 
-    // ── reply / done ──────────────────────────────────────────
     if (decision.action === "reply" || decision.action === "done") {
       finalReply = decision.reply ?? decision.reasoning;
       broadcast("reply_start", { agentName });
@@ -807,13 +975,11 @@ async function runAgent(userMsg: string, session: string): Promise<string> {
       break;
     }
 
-    // ── code ─────────────────────────────────────────────────
     if (decision.action === "code" && decision.code) {
       broadcast("code_start", { snippet: decision.code.slice(0, 300) });
       const { output, error } = await runCode(decision.code);
       broadcast("code_end", { output: output.slice(0, 600), error });
 
-      // Always update work log — this is what prevents forgetting
       const logEntry = error
         ? `[code ERROR] ${error.slice(0, 120)} | output: ${output.slice(0, 120)}`
         : `[code OK] ${decision.reasoning.slice(0, 80)} → ${output.slice(0, 150)}`;
@@ -827,7 +993,6 @@ async function runAgent(userMsg: string, session: string): Promise<string> {
       continue;
     }
 
-    // ── plan ──────────────────────────────────────────────────
     if (decision.action === "plan" && decision.plan?.length) {
       const tasks: Task[]    = [];
       const idx2id: string[] = [];
@@ -892,7 +1057,7 @@ async function runAgent(userMsg: string, session: string): Promise<string> {
 // Express routes
 // ─────────────────────────────────────────────────────────────
 
-app.use(express.json({ limit: "64kb" })); // message size limit
+app.use(express.json({ limit: "64kb" }));
 
 app.post("/chat", async (req: Request, res: Response) => {
   const { message, session } = req.body as { message?: string; session?: string };
@@ -924,12 +1089,9 @@ app.get("/metrics", (_: Request, res: Response) => {
 app.get("/health", (_: Request, res: Response) => res.json({
   ok: true, model: CFG.reasonModel,
   dirs: { agent: CFG.agentDir, workspace: CFG.workDir, skills: CFG.skillsDir },
+  sharedModules: SHARED_MODULES_DIR,
   activeSessions: sessionQueues.size,
 }));
-
-// ─────────────────────────────────────────────────────────────
-// Chat UI — streaming, collapsible thinking, WS auto-reconnect
-// ─────────────────────────────────────────────────────────────
 
 app.get("/", (_: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html");
@@ -943,28 +1105,13 @@ wss.on("connection", ws => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// Telegram (uncomment + npm i node-telegram-bot-api)
-// ─────────────────────────────────────────────────────────────
-// import TelegramBot from 'node-telegram-bot-api';
-// if (process.env.TELEGRAM_TOKEN) {
-//   const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
-//   bot.on('message', async msg => {
-//     if (!msg.text) return;
-//     bot.sendChatAction(msg.chat.id, 'typing');
-//     bot.sendMessage(msg.chat.id, await enqueue(String(msg.chat.id), () => runAgent(msg.text!, String(msg.chat.id))));
-//   });
-// }
-
-// ─────────────────────────────────────────────────────────────
 // Graceful shutdown
 // ─────────────────────────────────────────────────────────────
 
 async function shutdown(signal: string) {
   log.info(`${signal} received — shutting down gracefully`);
-  // Stop accepting new connections
   server.close(() => log.info("HTTP server closed"));
   wss.close(() => log.info("WebSocket server closed"));
-  // Wait for all active session queues to drain (max 30s)
   const queues = [...sessionQueues.values()];
   if (queues.length) {
     log.info(`Waiting for ${queues.length} active session(s) to finish…`);
@@ -990,4 +1137,5 @@ watchSkills();
 server.listen(CFG.port, () => {
   log.info(`Agent ready`, { url: `http://localhost:${CFG.port}`, model: CFG.reasonModel });
   log.info(`Dirs`, { agent: CFG.agentDir, workspace: CFG.workDir, skills: CFG.skillsDir });
+  log.info(`Shared modules`, { path: SHARED_MODULES_DIR });
 });
