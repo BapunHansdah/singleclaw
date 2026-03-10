@@ -1,0 +1,28 @@
+{
+  "name": "agent",
+  "version": "1.0.0",
+  "description": "Single-file AI Agent — Bedrock + RAG + State Machine",
+  "type": "module",
+  "scripts": {
+    "start": "tsx index.ts",
+    "dev": "tsx watch index.ts",
+    "skills": "tsx scripts/skill-add.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.600.0",
+    "better-sqlite3": "^12.6.2",
+    "dotenv": "^17.3.1",
+    "express": "^4.19.2",
+    "ws": "^8.17.0",
+    "zod": "^4.3.6",
+    "zod-to-json-schema": "^3.25.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.10",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.10",
+    "tsx": "^4.15.0",
+    "typescript": "^5.5.0"
+  }
+}

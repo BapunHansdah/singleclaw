@@ -1,0 +1,782 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Syne:wght@400;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --bg: #0a0a0f;
+        --surface: #111118;
+        --border: #1e1e2e;
+        --user-bg: #0f2d4a;
+        --user-bdr: #1a4a72;
+        --agent-bg: #13131f;
+        --agent-bdr: #252535;
+        --evt-bg: #0e0e18;
+        --text: #d0d0e0;
+        --muted: #505068;
+        --accent: #4e8ef7;
+        --accent2: #7c5af7;
+        --code-bg: #0c1220;
+        --green: #3ddc84;
+        --amber: #f0a020;
+        --radius: 14px;
+        --mono: "JetBrains Mono", monospace;
+        --sans: "Syne", sans-serif;
+      }
+
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      html,
+      body {
+        height: 100%;
+        background: var(--bg);
+        color: var(--text);
+        font-family: var(--sans);
+        font-size: 15px;
+        line-height: 1.6;
+        overflow: hidden;
+      }
+
+      /* ── Layout ─────────────────────────────────────────── */
+      #shell {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+      }
+
+      /* ── Header ─────────────────────────────────────────── */
+      #header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 14px 20px;
+        background: var(--surface);
+        border-bottom: 1px solid var(--border);
+        flex-shrink: 0;
+      }
+
+      #header-left {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      #logo {
+        width: 28px;
+        height: 28px;
+        background: linear-gradient(135deg, var(--accent), var(--accent2));
+        border-radius: 8px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 14px;
+        flex-shrink: 0;
+      }
+
+      #title {
+        font-size: 15px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        color: #e0e0f0;
+      }
+
+      #status-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--muted);
+        transition: background 0.3s;
+      }
+      #status-dot.online {
+        background: var(--green);
+        box-shadow: 0 0 6px var(--green);
+      }
+      #status-dot.busy {
+        background: var(--amber);
+        box-shadow: 0 0 6px var(--amber);
+      }
+
+      #status-label {
+        font-family: var(--mono);
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      /* ── Feed ───────────────────────────────────────────── */
+      #feed {
+        flex: 1;
+        overflow-y: auto;
+        padding: 24px 0;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        scroll-behavior: smooth;
+      }
+
+      #feed::-webkit-scrollbar {
+        width: 4px;
+      }
+      #feed::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      #feed::-webkit-scrollbar-thumb {
+        background: var(--border);
+        border-radius: 4px;
+      }
+
+      /* Row wrapper for alignment */
+      .row {
+        display: flex;
+        padding: 3px 20px;
+      }
+      .row.user {
+        justify-content: flex-end;
+      }
+      .row.agent {
+        justify-content: flex-start;
+      }
+      .row.evt {
+        justify-content: center;
+      }
+
+      /* ── Bubbles ─────────────────────────────────────────── */
+      .bubble {
+        /* Key fix: no max-width constraint that squishes — use ch units & clamp */
+        max-width: min(680px, 88%);
+        width: fit-content;
+        padding: 12px 16px;
+        border-radius: var(--radius);
+        white-space: pre-wrap;
+        word-break: break-word;
+        line-height: 1.65;
+        font-size: 14.5px;
+        animation: pop 0.18s ease;
+      }
+
+      @keyframes pop {
+        from {
+          opacity: 0;
+          transform: translateY(6px) scale(0.98);
+        }
+        to {
+          opacity: 1;
+          transform: none;
+        }
+      }
+
+      .bubble.user {
+        background: var(--user-bg);
+        border: 1px solid var(--user-bdr);
+        border-bottom-right-radius: 4px;
+        color: #c8ddf5;
+      }
+
+      .bubble.agent {
+        background: var(--agent-bg);
+        border: 1px solid var(--agent-bdr);
+        border-bottom-left-radius: 4px;
+        color: var(--text);
+      }
+
+      /* Agent label */
+      .agent-label {
+        font-family: var(--mono);
+        font-size: 10px;
+        font-weight: 500;
+        color: var(--accent);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        margin-bottom: 5px;
+      }
+
+      /* ── Event chips ─────────────────────────────────────── */
+      .evt-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 12px;
+        background: var(--evt-bg);
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        font-family: var(--mono);
+        font-size: 11px;
+        color: var(--muted);
+        max-width: min(600px, 90%);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        animation: fade 0.2s ease;
+      }
+      @keyframes fade {
+        from {
+          opacity: 0;
+        }
+        to {
+          opacity: 1;
+        }
+      }
+
+      .evt-chip .icon {
+        font-size: 10px;
+        opacity: 0.7;
+      }
+
+      .evt-chip.thinking {
+        color: var(--amber);
+        border-color: #3a2a00;
+        background: #120e00;
+      }
+      .evt-chip.code {
+        color: var(--green);
+        border-color: #0a2a18;
+        background: #060f0b;
+      }
+      .evt-chip.plan {
+        color: var(--accent2);
+        border-color: #1a0a3a;
+        background: #0a060f;
+      }
+      .evt-chip.subtask {
+        color: #a0a0b8;
+      }
+
+      /* ── Thinking block ──────────────────────────────────── */
+      .think-wrap {
+        max-width: min(680px, 88%);
+        border: 1px solid #1e2a1e;
+        border-radius: var(--radius);
+        overflow: hidden;
+        background: #090f09;
+      }
+
+      .think-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 14px;
+        cursor: pointer;
+        user-select: none;
+        background: #0c140c;
+        border-bottom: 1px solid #1e2a1e;
+      }
+      .think-header:hover {
+        background: #101810;
+      }
+
+      .think-icon {
+        color: var(--green);
+        font-size: 12px;
+      }
+      .think-title {
+        font-family: var(--mono);
+        font-size: 11px;
+        color: #60a060;
+        flex: 1;
+        letter-spacing: 0.06em;
+      }
+      .think-toggle {
+        font-family: var(--mono);
+        font-size: 10px;
+        color: var(--muted);
+      }
+
+      .think-body {
+        padding: 10px 14px;
+        font-family: var(--mono);
+        font-size: 12px;
+        color: #608060;
+        line-height: 1.7;
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 260px;
+        overflow-y: auto;
+      }
+      .think-body::-webkit-scrollbar {
+        width: 3px;
+      }
+      .think-body::-webkit-scrollbar-thumb {
+        background: #1e2a1e;
+      }
+
+      /* ── Typing indicator ────────────────────────────────── */
+      #typing {
+        display: none;
+        align-items: center;
+        gap: 4px;
+        padding: 10px 20px;
+      }
+      #typing.show {
+        display: flex;
+      }
+      .dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--muted);
+        animation: bounce 1.2s infinite ease-in-out;
+      }
+      .dot:nth-child(2) {
+        animation-delay: 0.2s;
+      }
+      .dot:nth-child(3) {
+        animation-delay: 0.4s;
+      }
+      @keyframes bounce {
+        0%,
+        80%,
+        100% {
+          transform: translateY(0);
+          opacity: 0.4;
+        }
+        40% {
+          transform: translateY(-5px);
+          opacity: 1;
+        }
+      }
+
+      /* ── Input bar ───────────────────────────────────────── */
+      #bar {
+        display: flex;
+        gap: 10px;
+        padding: 14px 20px;
+        background: var(--surface);
+        border-top: 1px solid var(--border);
+        flex-shrink: 0;
+        align-items: flex-end;
+      }
+
+      #inp {
+        flex: 1;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        color: var(--text);
+        padding: 11px 16px;
+        border-radius: 10px;
+        font-size: 14px;
+        font-family: var(--sans);
+        line-height: 1.5;
+        resize: none;
+        min-height: 44px;
+        max-height: 180px;
+        overflow-y: auto;
+        transition: border-color 0.2s;
+        outline: none;
+      }
+
+      #inp:focus {
+        border-color: var(--accent);
+      }
+      #inp::placeholder {
+        color: var(--muted);
+      }
+
+      #send-btn {
+        width: 44px;
+        height: 44px;
+        flex-shrink: 0;
+        background: linear-gradient(135deg, var(--accent), var(--accent2));
+        border: none;
+        border-radius: 10px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition:
+          opacity 0.2s,
+          transform 0.1s;
+      }
+      #send-btn:hover {
+        opacity: 0.88;
+      }
+      #send-btn:active {
+        transform: scale(0.95);
+      }
+      #send-btn:disabled {
+        opacity: 0.3;
+        cursor: not-allowed;
+      }
+
+      #send-btn svg {
+        width: 18px;
+        height: 18px;
+        fill: white;
+      }
+
+      /* ── WS reconnect banner ─────────────────────────────── */
+      #reconnect-banner {
+        display: none;
+        position: fixed;
+        top: 60px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: #2a1500;
+        border: 1px solid #5a3000;
+        color: var(--amber);
+        padding: 7px 18px;
+        border-radius: 8px;
+        font-family: var(--mono);
+        font-size: 12px;
+        z-index: 99;
+      }
+      #reconnect-banner.show {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="shell">
+      <div id="header">
+        <div id="header-left">
+          <div id="logo">⬡</div>
+          <span id="title">AGENT</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px">
+          <div id="status-dot"></div>
+          <span id="status-label">connecting…</span>
+        </div>
+      </div>
+
+      <div id="feed"></div>
+
+      <div id="typing">
+        <div class="dot"></div>
+        <div class="dot"></div>
+        <div class="dot"></div>
+      </div>
+
+      <div id="bar">
+        <textarea id="inp" rows="1" placeholder="Ask the agent…"></textarea>
+        <button id="send-btn" disabled>
+          <svg viewBox="0 0 24 24">
+            <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div id="reconnect-banner">⚡ Reconnecting…</div>
+
+    <script>
+      const feed = document.getElementById("feed");
+      const inp = document.getElementById("inp");
+      const sendBtn = document.getElementById("send-btn");
+      const typing = document.getElementById("typing");
+      const statusDot = document.getElementById("status-dot");
+      const statusLbl = document.getElementById("status-label");
+      const banner = document.getElementById("reconnect-banner");
+
+      let busy = false;
+      let retries = 0;
+      let ws;
+
+      /* ── WebSocket ──────────────────────────────────────── */
+      function connect() {
+        ws = new WebSocket("ws://" + location.host);
+
+        ws.onopen = () => {
+          retries = 0;
+          banner.classList.remove("show");
+          setStatus("online", "online");
+          sendBtn.disabled = false;
+        };
+
+        ws.onclose = () => {
+          setStatus("", "offline");
+          sendBtn.disabled = true;
+          const wait = Math.min(10000, 1000 * Math.pow(2, retries++));
+          banner.textContent = `⚡ Reconnecting in ${Math.round(wait / 1000)}s…`;
+          banner.classList.add("show");
+          setTimeout(connect, wait);
+        };
+
+        ws.onmessage = (e) => {
+          const { type, payload } = JSON.parse(e.data);
+
+          // ── Non-streaming (v2) events ──
+          if (type === "reply") {
+            hideTyping();
+            addBubble("agent", payload.message);
+            setStatus("online", "online");
+            busy = false;
+            sendBtn.disabled = false;
+          } else if (type === "agent_status") {
+            hideTyping();
+            // show as a simple agent bubble, NOT a reply bubble
+            addBubble("agent", payload.text);
+            // DO NOT set busy=false or re-enable sendBtn here
+          } else if (type === "iter" || type === "thinking") {
+            showTyping();
+            addEvt(
+              "thinking",
+              "⟳ " +
+                (payload.goal || payload.message || "thinking…").slice(0, 90),
+            );
+          } else if (type === "code") {
+            addEvt("code", "⌥ " + (payload.snippet || "").slice(0, 90));
+          } else if (type === "result" || type === "tool_result") {
+            // ignore — agent loop handles it
+          } else if (type === "plan") {
+            addEvt(
+              "plan",
+              "◈ plan · " + (payload.tasks?.length ?? 0) + " tasks",
+            );
+          } else if (type === "subtask") {
+            addEvt(
+              "subtask",
+              "↳ " + (payload.goal || payload.status || "").slice(0, 80),
+            );
+
+            // ── Streaming (v3) events ──
+          } else if (type === "thinking_start") {
+            hideTyping();
+            currentThink = startThinkBubble();
+          } else if (type === "thinking_end") {
+            closeThinkBubble();
+          } else if (type === "reply_start") {
+            closeThinkBubble();
+            hideTyping();
+            currentBubble = startStreamBubble();
+          } else if (type === "stream_chunk") {
+            const chunk = payload.text ?? payload.chunk ?? "";
+            if (currentThink) {
+              currentThink.textContent += chunk;
+              scroll();
+            } else if (currentBubble) {
+              currentBubble.textContent += chunk;
+              scroll();
+            }
+          } else if (type === "reply_end") {
+            currentBubble = null;
+            setStatus("online", "online");
+            busy = false;
+            sendBtn.disabled = false;
+          } else if (type === "decision") {
+            addEvt(
+              "thinking",
+              "⟳ " +
+                (payload.action || "") +
+                (payload.reasoning
+                  ? " · " + payload.reasoning.slice(0, 70)
+                  : ""),
+            );
+          } else if (type === "code_start" || type === "code_exec") {
+            addEvt(
+              "code",
+              "⌥ " + (payload.code || payload.snippet || "").slice(0, 90),
+            );
+          } else if (type === "code_end") {
+            const out = payload.output ? payload.output.slice(0, 120) : "";
+            const err = payload.error ? "✕ " + payload.error.slice(0, 80) : "";
+            addEvt("code", "⌥ done" + (err || (out ? " · " + out : "")));
+            showTyping();
+          } else if (type === "skills_reload") {
+            addEvt("", "↺ skills reloaded");
+          }
+        };
+      }
+
+      /* ── UI helpers ─────────────────────────────────────── */
+      function setStatus(cls, label) {
+        statusDot.className = cls;
+        statusLbl.textContent = label;
+      }
+
+      function showTyping() {
+        typing.classList.add("show");
+        scroll();
+      }
+      function hideTyping() {
+        typing.classList.remove("show");
+      }
+
+      function scroll() {
+        feed.scrollTop = feed.scrollHeight;
+      }
+
+      function addBubble(role, text) {
+        const row = document.createElement("div");
+        row.className = "row " + role;
+
+        if (role === "agent") {
+          const col = document.createElement("div");
+          col.style.display = "flex";
+          col.style.flexDirection = "column";
+          col.style.gap = "4px";
+
+          const lbl = document.createElement("div");
+          lbl.className = "agent-label";
+          lbl.textContent = "Agent";
+
+          const bub = document.createElement("div");
+          bub.className = "bubble agent";
+          bub.textContent = text;
+
+          col.appendChild(lbl);
+          col.appendChild(bub);
+          row.appendChild(col);
+        } else {
+          const bub = document.createElement("div");
+          bub.className = "bubble user";
+          bub.textContent = text;
+          row.appendChild(bub);
+        }
+
+        feed.appendChild(row);
+        scroll();
+      }
+
+      function addEvt(kind, text) {
+        const row = document.createElement("div");
+        row.className = "row evt";
+        const chip = document.createElement("div");
+        chip.className = "evt-chip " + kind;
+        chip.textContent = text;
+        row.appendChild(chip);
+        feed.appendChild(row);
+        scroll();
+      }
+
+      /* ── Send ───────────────────────────────────────────── */
+      async function send() {
+        const msg = inp.value.trim();
+        if (!msg || busy) return;
+
+        busy = true;
+        sendBtn.disabled = true;
+        inp.value = "";
+        autoResize();
+
+        addBubble("user", msg);
+        showTyping();
+        setStatus("busy", "thinking…");
+
+        try {
+          const r = await fetch("/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: msg, session: "browser" }),
+          });
+          const d = await r.json();
+          // WS will deliver the reply — but if it doesn't (REST-only), show it here
+          if (!ws || ws.readyState !== WebSocket.OPEN) {
+            hideTyping();
+            addBubble("agent", d.reply || d.error || "(no response)");
+            busy = false;
+            sendBtn.disabled = false;
+            setStatus("online", "online");
+          }
+        } catch (err) {
+          hideTyping();
+          addEvt("", "✕ " + err.message);
+          busy = false;
+          sendBtn.disabled = false;
+          setStatus("online", "online");
+        }
+      }
+
+      /* ── Textarea auto-resize ───────────────────────────── */
+      function autoResize() {
+        inp.style.height = "auto";
+        inp.style.height = Math.min(inp.scrollHeight, 180) + "px";
+      }
+
+      inp.addEventListener("input", autoResize);
+      inp.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          send();
+        }
+      });
+      document.getElementById("send-btn").onclick = send;
+
+      /* ── Streaming bubbles ──────────────────────────────── */
+      let currentBubble = null;
+      let currentThink = null;
+
+      function startThinkBubble() {
+        const row = document.createElement("div");
+        row.className = "row agent";
+
+        const wrap = document.createElement("div");
+        wrap.className = "think-wrap";
+
+        const header = document.createElement("div");
+        header.className = "think-header";
+        header.innerHTML =
+          '<span class="think-icon">◎</span><span class="think-title">Thinking…</span><span class="think-toggle">▾</span>';
+
+        const body = document.createElement("div");
+        body.className = "think-body";
+
+        header.addEventListener("click", () => {
+          const isHidden = body.style.display === "none";
+          body.style.display = isHidden ? "block" : "none";
+          header.querySelector(".think-toggle").textContent = isHidden
+            ? "▾"
+            : "▸";
+        });
+
+        wrap.appendChild(header);
+        wrap.appendChild(body);
+        row.appendChild(wrap);
+        feed.appendChild(row);
+        scroll();
+        return body;
+      }
+
+      function closeThinkBubble() {
+        if (!currentThink) return;
+        const wrap = currentThink.closest(".think-wrap");
+        if (wrap) {
+          const title = wrap.querySelector(".think-title");
+          const toggle = wrap.querySelector(".think-toggle");
+          if (title) title.textContent = "Reasoning";
+          currentThink.style.display = "none";
+          if (toggle) toggle.textContent = "▸";
+        }
+        currentThink = null;
+      }
+
+      function startStreamBubble() {
+        const row = document.createElement("div");
+        row.className = "row agent";
+
+        const col = document.createElement("div");
+        col.style.display = "flex";
+        col.style.flexDirection = "column";
+        col.style.gap = "4px";
+
+        const lbl = document.createElement("div");
+        lbl.className = "agent-label";
+        lbl.textContent = "Agent";
+
+        const bub = document.createElement("div");
+        bub.className = "bubble agent";
+        bub.textContent = "";
+
+        col.appendChild(lbl);
+        col.appendChild(bub);
+        row.appendChild(col);
+        feed.appendChild(row);
+        scroll();
+        return bub;
+      }
+
+      /* ── Boot ───────────────────────────────────────────── */
+      connect();
+    </script>
+  </body>
+</html>

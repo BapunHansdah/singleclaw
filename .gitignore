@@ -1,0 +1,7 @@
+.env
+pnpm-lock.yaml
+node_
+node_modules
+agent
+skills
+workspace
