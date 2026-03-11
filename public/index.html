@@ -584,6 +584,8 @@
             showTyping();
           } else if (type === "skills_reload") {
             addEvt("", "↺ skills reloaded");
+          } else if ( type ==="token_usage") {
+            addEvt("token-usage", "⌥ " + JSON.stringify(payload));
           }
         };
       }
